@@ -61,7 +61,30 @@ setup_backend() {
   pm2 save
 }
 
-# Налаштування Nginx
+# Створення основного HTML сайту
+create_main_html() {
+  cat > /var/www/html/index.html <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Основний сайт</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+        button { padding: 15px 25px; margin: 10px; font-size: 18px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Ласкаво просимо до головного сайту!</h1>
+    <button onclick="window.location.href='https://minecraft.local'">Minecraft Dashboard</button>
+    <button onclick="window.location.href='https://vps.local'">VPS Manager</button>
+</body>
+</html>
+EOF
+}
+
+# Створення Nginx конфігурацій
 setup_nginx() {
   # Створення конфігурацій для піддоменів
   cat > $NGINX_DIR/main_site <<EOF
@@ -161,6 +184,7 @@ display_instructions() {
 install_packages
 generate_ssl_certificates
 generate_credentials
+create_main_html
 setup_backend
 setup_nginx
 setup_firewall
