@@ -1,350 +1,215 @@
-#!/usr/bin/env bash
-# auto_site_installer_local.sh
-# Один файл — повна автоматична інсталяція мінімалістичного сайту + Minecraft dashboard + VPS manager (Docker)
-# Призначено для локальної мережі (emulated subdomains: minecraft.local, vps.local)
-# Працює на Ubuntu 22.04 / 24.04
-set -euo pipefail
-IFS=$'\n\t'
+#!/bin/bash
 
-###########################
-# Конфігурація (редагуй за потреби)
-###########################
-MAIN_HOSTNAME="${1:-localhost}"   # для локалки: localhost або IP (в UI виводимо LAN IP)
-MC_HOST="minecraft.local"
-VPS_HOST="vps.local"
-APP_DIR="/opt/auto_site"
-BIN_DIR="${APP_DIR}/bin"
-CRED_FILE="/root/auto_site_credentials.txt"
-NODE_PORT=3000
-PM2_NAME="auto-site-backend"
-MINECRAFT_USER="minecraft"
-SRV_MINECRAFT_ROOT="/srv/minecraft"
-SRV_VPS_ROOT="/srv/vps"
-SSL_DIR="/etc/ssl/localcerts"
-###########################
-
-# require root
-if [[ $EUID -ne 0 ]]; then
-  echo "Запустіть скрипт від root (sudo)."
+# Перевірка на права root
+if [ "$EUID" -ne 0 ]; then
+  echo "Будь ласка, запустіть цей скрипт як root."
   exit 1
 fi
 
-echo "=== Auto deploy: minimal local site + minecraft & vps managers ==="
-
+# Перемикаємо на non-interactive режим
 export DEBIAN_FRONTEND=noninteractive
 
-# Helper: generate random password
-randpass() {
-  head /dev/urandom | tr -dc 'A-Za-z0-9!@%+-_' | head -c 20 || echo "pass$(date +%s)"
-}
+# Оновлення системи
+apt update -y && apt upgrade -y
 
-# Determine LAN IP (best-effort)
-LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')"
-if [[ -z "$LAN_IP" ]]; then
-  LAN_IP="$(hostname -I | awk '{print $1}')"
-fi
-if [[ -z "$LAN_IP" ]]; then
-  LAN_IP="127.0.0.1"
-fi
-echo "Detected LAN IP: ${LAN_IP}"
+# Встановлення необхідних пакетів
+apt install -y nginx docker.io docker-compose nodejs npm pm2 openjdk-17-jre-headless git jq ufw
 
-# Create directories
-mkdir -p "${APP_DIR}"
-mkdir -p "${BIN_DIR}"
-mkdir -p "${SRV_MINECRAFT_ROOT}"
-mkdir -p "${SRV_VPS_ROOT}"
-mkdir -p "${SSL_DIR}"
+# Створення користувача admin та збереження пароля
+ADMIN_PASSWORD=$(openssl rand -base64 12)
+HASHED_PASSWORD=$(echo "$ADMIN_PASSWORD" | bcrypt)
+echo "admin:$HASHED_PASSWORD" > /root/auto_site_credentials.txt
+chmod 600 /root/auto_site_credentials.txt
 
-# Update + install base packages
-apt-get update -y
-apt-get upgrade -y
+# Генерація JWT ключа
+JWT_SECRET=$(openssl rand -base64 32)
 
-# Install utilities and required packages
-apt-get install -y curl wget gnupg2 ca-certificates lsb-release software-properties-common \
-  build-essential jq git ufw
+# Створення директорії для сайту
+mkdir -p /opt/auto_site
+cd /opt/auto_site
 
-# Node.js (setup NodeSource LTS 20)
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-fi
+# Створення файлів для Node.js бекенду
+cat <<EOL > /opt/auto_site/server.js
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const app = express();
+const port = 3000;
 
-# npm global pm2
-if ! command -v pm2 >/dev/null 2>&1; then
-  npm install -g pm2@latest || true
-fi
+const users = { 'admin': '$HASHED_PASSWORD' };
+const JWT_SECRET = '$JWT_SECRET';
 
-# Java for PaperMC
-apt-get install -y openjdk-17-jre-headless
+app.use(express.json());
 
-# nginx
-apt-get install -y nginx
+app.get('/', (req, res) => res.send('Welcome to the Auto Site Dashboard'));
 
-# docker
-if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
-fi
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  if (users[username] && bcrypt.compareSync(password, users[username])) {
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '1h' });
+    res.json({ token });
+  } else {
+    res.status(401).send('Unauthorized');
+  }
+});
 
-# docker-compose plugin (compose v2)
-if ! docker compose version >/dev/null 2>&1; then
-  apt-get install -y docker-compose-plugin
-fi
+// Define routes for Minecraft and VPS management APIs
 
-# jq, git already installed above
-apt-get install -y jq
+app.listen(port, () => {
+  console.log(`Server running at http://localhost:${port}`);
+});
+EOL
 
-# certbot optional (we use self-signed for local)
-apt-get install -y certbot python3-certbot-nginx || true
+# Створення простого HTML для головної сторінки
+cat <<EOL > /opt/auto_site/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Auto Site</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+    button { margin: 10px; padding: 10px 20px; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Welcome to the Auto Site Dashboard</h1>
+  <button onclick="window.location.href='https://minecraft.local'">Minecraft Dashboard</button>
+  <button onclick="window.location.href='https://vps.local'">VPS Manager</button>
+</body>
+</html>
+EOL
 
-# ufw
-apt-get install -y ufw
+# Створення сервісу для Node.js через pm2
+pm2 start /opt/auto_site/server.js --name auto_site --watch
+pm2 startup
+pm2 save
 
-# Ensure ufw basic rules
-ufw --force allow OpenSSH || true
-ufw --force allow 80/tcp || true
-ufw --force allow 443/tcp || true
-ufw --force enable || true
+# Створення допоміжних скриптів для Minecraft і VPS
+cat <<EOL > /usr/local/bin/create_minecraft.sh
+#!/bin/bash
+NAME=\$1
+RAM=\$2
+PORT=\$3
+USER=minecraft
 
-# Create credentials (idempotent)
-if [[ -f "${CRED_FILE}" ]]; then
-  echo "Credentials file exists, reading..."
-  ADMIN_USER="$(grep '^Admin user:' -m1 "${CRED_FILE}" | awk -F': ' '{print $2}' || echo "admin")"
-  ADMIN_PASSWORD="$(grep '^Admin password:' -m1 "${CRED_FILE}" | awk -F': ' '{print $2}' || randpass)"
-  JWT_SECRET="$(grep '^JWT secret:' -m1 "${CRED_FILE}" | awk -F': ' '{print $2}' || randpass)"
-else
-  ADMIN_USER="admin"
-  ADMIN_PASSWORD="$(randpass)"
-  JWT_SECRET="$(randpass)"
-  {
-    echo "Generated on: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "LAN IP: ${LAN_IP}"
-    echo "Admin user: ${ADMIN_USER}"
-    echo "Admin password: ${ADMIN_PASSWORD}"
-    echo "JWT secret: ${JWT_SECRET}"
-  } > "${CRED_FILE}"
-  chmod 600 "${CRED_FILE}"
-fi
-
-# Add /etc/hosts entries for local hostnames (idempotent)
-if ! grep -q "${MC_HOST}" /etc/hosts; then
-  echo "Adding ${MC_HOST} to /etc/hosts -> ${LAN_IP}"
-  echo "${LAN_IP}    ${MC_HOST} ${MC_HOST}.local" >> /etc/hosts
-fi
-if ! grep -q "${VPS_HOST}" /etc/hosts; then
-  echo "Adding ${VPS_HOST} to /etc/hosts -> ${LAN_IP}"
-  echo "${LAN_IP}    ${VPS_HOST} ${VPS_HOST}.local" >> /etc/hosts
-fi
-# Ensure MAIN_HOSTNAME maps too if it's not localhost
-if [[ "${MAIN_HOSTNAME}" != "localhost" && ! $(grep -q "${MAIN_HOSTNAME}" /etc/hosts || true) ]]; then
-  echo "${LAN_IP}    ${MAIN_HOSTNAME}" >> /etc/hosts
-fi
-
-###########################
-# Helper scripts
-###########################
-
-# create_minecraft.sh
-cat > "${BIN_DIR}/create_minecraft.sh" <<'MC_SH'
-#!/usr/bin/env bash
-set -euo pipefail
-name="${1:-}"
-ram_mb="${2:-2048}"
-port="${3:-25565}"
-srv_root="/srv/minecraft"
-user="minecraft"
-
-if [[ -z "$name" ]]; then
-  echo '{"error":"name required"}'
-  exit 1
-fi
-
-# create minecraft user if not exists
-if ! id -u "$user" >/dev/null 2>&1; then
-  useradd -m -r -s /usr/sbin/nologin "$user"
-fi
-
-mkdir -p "${srv_root}/${name}"
-installdir="${srv_root}/${name}"
-chown -R ${user}:${user} "${installdir}"
-
-cd "${installdir}"
-
-# fetch latest PaperMC version
-if ! command -v jq >/dev/null 2>&1; then apt-get update -y && apt-get install -y jq; fi
-versions_json=$(curl -s "https://api.papermc.io/v2/projects/paper")
-version=$(echo "$versions_json" | jq -r '.versions | last')
-builds_json=$(curl -s "https://api.papermc.io/v2/projects/paper/versions/${version}/builds")
-build_id=$(echo "$builds_json" | jq -r '.builds | last | .build')
-jar_name="paper-${version}-${build_id}.jar"
-jar_url="https://api.papermc.io/v2/projects/paper/versions/${version}/builds/${build_id}/downloads/${jar_name}"
-
-if [[ ! -f paper.jar ]]; then
-  echo "Downloading PaperMC ${version} build ${build_id}..."
-  curl -L --fail -o paper.jar "$jar_url" || { echo '{"error":"failed to download paper.jar"}'; exit 1; }
-fi
-
-# eula and server.properties
-echo "eula=true" > eula.txt
-cat > server.properties <<EOF
-server-port=${port}
-motd=Auto-deployed PaperMC
-online-mode=true
-EOF
-
-# start script
-cat > start.sh <<'EOF'
-#!/usr/bin/env bash
-cd "$(dirname "$0")"
-exec /usr/bin/java -Xmx${RAM}M -Xms128M -jar paper.jar nogui
-EOF
-# Replace placeholder RAM with actual value
-sed -i "s/\${RAM}/${ram_mb}/g" start.sh
-chmod +x start.sh
-chown ${user}:${user} start.sh paper.jar eula.txt server.properties
-
-# systemd unit
-service_name="minecraft-${name}.service"
-cat > /etc/systemd/system/${service_name} <<EOF
-[Unit]
-Description=Minecraft PaperMC server ${name}
+if [ ! -d "/home/\$USER/\$NAME" ]; then
+  mkdir -p /home/\$USER/\$NAME
+  cd /home/\$USER/\$NAME
+  wget https://api.papermc.io/v2/projects/paper/versions/latest/builds/latest/downloads/paper-\$PORT.jar -O paper.jar
+  echo "eula=true" > eula.txt
+  echo "server-port=\$PORT" > server.properties
+  useradd -m -d /home/\$USER/\$NAME -s /bin/bash \$USER
+  echo "\$USER ALL=(ALL) NOPASSWD: /usr/bin/java" > /etc/sudoers.d/\$USER
+  echo "[Unit]
+Description=Minecraft Server for \$NAME
 After=network.target
 
 [Service]
-User=${user}
-WorkingDirectory=${installdir}
-ExecStart=/bin/bash ${installdir}/start.sh
-Restart=on-failure
-RestartSec=5
+WorkingDirectory=/home/\$USER/\$NAME
+ExecStart=/usr/bin/java -Xmx\$RAM -Xms\$RAM -jar paper.jar nogui
+User=\$USER
+Restart=always
+RestartSec=5s
 
 [Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now "${service_name}"
-
-echo "{\"ok\":true,\"service\":\"${service_name}\",\"path\":\"${installdir}\",\"port\":${port}}"
-MC_SH
-chmod +x "${BIN_DIR}/create_minecraft.sh"
-ln -sf "${BIN_DIR}/create_minecraft.sh" /usr/local/bin/create_minecraft.sh
-
-# create_vps.sh
-cat > "${BIN_DIR}/create_vps.sh" <<'VPS_SH'
-#!/usr/bin/env bash
-set -euo pipefail
-name="${1:-}"
-host_ssh_port="${2:-0}"
-root_pass="${3:-}"
-
-srv_root="/srv/vps"
-img_tag="local/ubuntu-sshd:latest"
-build_dir="/tmp/auto_vps_build_${name}"
-
-if [[ -z "$name" ]]; then
-  echo '{"error":"name required"}'
-  exit 1
-fi
-mkdir -p "${srv_root}/${name}"
-
-# Build image once (idempotent)
-if ! docker image inspect "${img_tag}" >/dev/null 2>&1; then
-  rm -rf "${build_dir}"
-  mkdir -p "${build_dir}"
-  cat > "${build_dir}/Dockerfile" <<EOF
-FROM ubuntu:22.04
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y openssh-server passwd sudo && \\
-    mkdir /var/run/sshd && \\
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-EXPOSE 22
-CMD ["/usr/sbin/sshd","-D"]
-EOF
-  docker build -t "${img_tag}" "${build_dir}"
-fi
-
-container_name="vps_${name}"
-
-# remove existing container with same name
-if docker ps -a --format '{{.Names}}' | grep -x "${container_name}" >/dev/null 2>&1; then
-  echo "Container ${container_name} exists, removing..."
-  docker rm -f "${container_name}" || true
-fi
-
-# choose host port
-if [[ "${host_ssh_port}" -eq 0 ]]; then
-  host_ssh_port=$(( 30000 + (RANDOM % 10000) ))
-fi
-
-docker run -d --name "${container_name}" -v "${srv_root}/${name}":/root -p "${host_ssh_port}":22 "${img_tag}"
-
-# set root password if provided
-if [[ -n "${root_pass}" ]]; then
-  docker exec -i "${container_name}" bash -c "echo 'root:${root_pass}' | chpasswd" || true
+WantedBy=multi-user.target" > /etc/systemd/system/minecraft-\$NAME.service
+  systemctl enable minecraft-\$NAME.service
+  systemctl start minecraft-\$NAME.service
+  echo "Minecraft server \$NAME created successfully!"
 else
-  # generate random and set
-  rp=$(head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 12)
-  docker exec -i "${container_name}" bash -c "echo 'root:${rp}' | chpasswd" || true
-  root_pass="${rp}"
+  echo "Minecraft server \$NAME already exists!"
 fi
+EOL
 
-echo "{\"ok\":true,\"container\":\"${container_name}\",\"host_ssh_port\":${host_ssh_port},\"root_pass\":\"${root_pass}\"}"
-VPS_SH
-chmod +x "${BIN_DIR}/create_vps.sh"
-ln -sf "${BIN_DIR}/create_vps.sh" /usr/local/bin/create_vps.sh
+cat <<EOL > /usr/local/bin/create_vps.sh
+#!/bin/bash
+NAME=\$1
+SSH_PORT=\$2
+PASSWORD=\$3
 
-###########################
-# Node.js app (Express) + static UI — all in one
-###########################
-mkdir -p "${APP_DIR}/app"
-cd "${APP_DIR}/app"
+if [ ! -d "/srv/vps/\$NAME" ]; then
+  mkdir -p /srv/vps/\$NAME
+  docker run -d -p \$SSH_PORT:22 --name \$NAME ubuntu:latest
+  docker exec \$NAME bash -c "apt update && apt install -y openssh-server"
+  docker exec \$NAME bash -c "echo 'root:\$PASSWORD' | chpasswd"
+  echo "VPS \$NAME created successfully on port \$SSH_PORT"
+  ufw allow \$SSH_PORT
+else
+  echo "VPS \$NAME already exists!"
+fi
+EOL
 
-# package.json
-cat > package.json <<'PKG'
-{
-  "name": "auto-site-backend",
-  "version": "1.0.0",
-  "main": "app.js",
-  "dependencies": {
-    "express": "^4.18.2",
-    "bcrypt": "^5.1.0",
-    "jsonwebtoken": "^9.0.0",
-    "body-parser": "^1.20.2"
-  }
+chmod +x /usr/local/bin/create_minecraft.sh
+chmod +x /usr/local/bin/create_vps.sh
+
+# Створення Nginx конфігурацій
+mkdir -p /etc/ssl/localcerts
+openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/ssl/localcerts/selfsigned.key -out /etc/ssl/localcerts/selfsigned.crt -days 365 -subj "/CN=localhost"
+cat <<EOL > /etc/nginx/sites-available/default
+server {
+    listen 80;
+    server_name localhost;
+
+    location / {
+        root /opt/auto_site;
+        index index.html;
+    }
+
+    location /minecraft {
+        proxy_pass http://localhost:3000;
+    }
+
+    location /vps {
+        proxy_pass http://localhost:3000;
+    }
+
+    return 301 https://\$host\$request_uri;
 }
-PKG
 
-# .env
-cat > .env <<ENV
-ADMIN_USER=${ADMIN_USER}
-ADMIN_PASSWORD=${ADMIN_PASSWORD}
-JWT_SECRET=${JWT_SECRET}
-PORT=${NODE_PORT}
-ENV
-chmod 600 .env
+server {
+    listen 443 ssl;
+    server_name localhost;
 
-# app.js
-cat > app.js <<'APPJS'
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { execFile, exec } = require('child_process');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const bodyParser = require('body-parser');
+    ssl_certificate /etc/ssl/localcerts/selfsigned.crt;
+    ssl_certificate_key /etc/ssl/localcerts/selfsigned.key;
 
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+    location / {
+        root /opt/auto_site;
+        index index.html;
+    }
 
-const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const JWT_SECRET = process.env.JWT_SECRET || 'secret';
-const PORT = process.env.PORT || 3000;
+    location /minecraft {
+        proxy_pass http://localhost:3000;
+    }
 
-const app = express();
-app.use(bodyParser.json());
-app.use(express.static(path.join(__dirname, 'static')));
+    location /vps {
+        proxy_pass http://localhost:3000;
+    }
+}
+EOL
 
-// Pre-hash admin password at startup
-let adminHash = null;
-(async () => {
-  const salt = await bcrypt
+# Налаштування UFW
+ufw allow 22
+ufw allow 80
+ufw allow 443
+ufw enable
+
+# Запуск Nginx
+systemctl restart nginx
+
+# Підсумок
+echo "✅ Установка завершена!"
+echo "Головна сторінка: http://<LAN-IP> або http://localhost"
+echo "Minecraft Dashboard: https://minecraft.local"
+echo "VPS Manager: https://vps.local"
+echo "Логін: admin"
+echo "Пароль: (див. /root/auto_site_credentials.txt)"
+
+# Інструкція
+echo "Як змінити пароль: редагуйте /root/auto_site_credentials.txt"
+echo "Як видалити Minecraft сервер: systemctl stop minecraft-<name>.service && systemctl disable minecraft-<name>.service"
+echo "Як видалити VPS: docker rm -f <name>"
+echo "Як вимкнути pm2-сервіс: pm2 stop auto_site"
+echo "Рекомендується: встановити 2FA для SSH, обмежити доступ за IP."
